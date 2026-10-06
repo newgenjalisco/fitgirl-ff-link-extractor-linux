@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build Linux binary
 
 on:
   push:
@@ -7,28 +7,33 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4  # Updated to v4
+      uses: actions/checkout@v4
 
     - name: Set up Python
-      uses: actions/setup-python@v5 # Updated to v5
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
 
-    - name: Install dependencies
+    - name: Install system dependencies (Tkinter)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y python3-tk
+
+    - name: Install Python dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install pyinstaller requests beautifulsoup4 undetected-chromedriver setuptools
+        pip install -r requirements.txt pyinstaller
 
-    - name: Build EXE with PyInstaller
+    - name: Build binary with PyInstaller
       run: |
-        pyinstaller --onefile --noconsole --name="FitGirl_FF_Link_Extractor" ff_grabber.py
+        pyinstaller --onefile --name="FitGirl_FF_Link_Extractor-linux" ff_grabber.py
 
-    - name: Upload EXE Artifact
-      uses: actions/upload-artifact@v4 # Updated to v4
+    - name: Upload binary artifact
+      uses: actions/upload-artifact@v4
       with:
-        name: FitGirl_FF_Link_Extractor-Windows
-        path: dist/FitGirl_FF_Link_Extractor.exe
+        name: FitGirl_FF_Link_Extractor-linux
+        path: dist/FitGirl_FF_Link_Extractor-linux

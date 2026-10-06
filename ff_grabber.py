@@ -20,6 +20,7 @@ def diag(msg, exc=False):
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
+import queue
 import time
 import re
 import requests
@@ -56,6 +57,15 @@ class FitgirlExtractorApp:
         # ------------------------------------
 
         self.setup_ui()
+
+        # Thread-safe UI dispatch: worker threads must NEVER call Tk
+        # methods directly (that can deadlock the interpreter and leave
+        # the app stuck on "Fetching page..."). They enqueue callables
+        # here; the main thread executes them via _poll_ui_queue.
+        self._ui_queue = queue.Queue()
+        self._fetch_token = 0
+        self._fetch_active = False
+        self._poll_ui_queue()
 
         # Bind MouseWheel globally
         self.root.bind_all("<MouseWheel>", self._on_mousewheel)
@@ -222,12 +232,60 @@ class FitgirlExtractorApp:
 
     # --- Step 1: Fetching Links ---
 
+    # --- Thread-safe UI dispatch (main thread only executes these) ---
+
+    def _ui_put(self, fn, *args):
+        """Enqueue a UI callable from any thread. Never calls Tk directly."""
+        self._ui_queue.put((fn, args))
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                fn, args = self._ui_queue.get_nowait()
+                try:
+                    fn(*args)
+                except Exception as e:
+                    diag(f"UI CALLBACK ERROR: {e}", exc=True)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_ui_queue)
+
+    def _fetch_watchdog(self, token):
+        """Failsafe: if a fetch is still stuck after 45s (stalled
+        connection, blocked site), unstick the UI and ignore the late
+        thread when it eventually returns."""
+        if self._fetch_active and token == self._fetch_token:
+            diag("FETCH WATCHDOG: fetch still stuck after 45s, releasing UI")
+            self._fetch_active = False
+            self._fetch_token += 1  # invalidate the stuck thread's token
+            self.status_var.set(
+                "Fetch timed out: connection stalled or site blocking requests. "
+                "Run from terminal to see details, or try a VPN/Custom DNS."
+            )
+            self.fetch_btn.config(state="normal")
+
+    def _fetch_done(self, token):
+        if token == self._fetch_token:
+            self._fetch_active = False
+            self.fetch_btn.config(state="normal")
+
+    def populate_checkboxes_token(self, token, links):
+        if token != self._fetch_token:
+            return  # stale result from a timed-out fetch; ignore
+        self.populate_checkboxes(links)
+
+
+    # --- Step 1: Fetching Links ---
+
     def start_fetch_thread(self):
         url = self.url_var.get().strip()
         if not url:
             messagebox.showerror("Error", "Please enter a valid FitGirl URL.")
             return
 
+        self._fetch_token += 1
+        token = self._fetch_token
+        self._fetch_active = True
         self.fetch_btn.config(state="disabled")
         self.extract_btn.config(state="disabled")
         self.status_var.set("Fetching page...")
@@ -237,31 +295,109 @@ class FitgirlExtractorApp:
             widget.destroy()
         self.checkbox_vars.clear()
 
-        thread = threading.Thread(target=self.run_fetch, args=(url,), daemon=True)
+        thread = threading.Thread(target=self.run_fetch, args=(url, token), daemon=True)
         thread.start()
+        # Failsafe so the UI can never stick on "Fetching page..." forever
+        self.root.after(45000, lambda: self._fetch_watchdog(token))
 
-    def run_fetch(self, url):
+    def run_fetch(self, url, token):
+        """Worker thread: must never touch Tk directly, only via _ui_put.
+        Uses streaming + an overall byte/time budget so a trickling or
+        stalled connection cannot hang forever (requests' timeout is
+        per-read and resets on every byte received)."""
+        diag(f"FETCH START: {url}")
         try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            res = requests.get(url, headers=headers, timeout=10) # Restored Timeout
-            res.raise_for_status() 
-            soup = BeautifulSoup(res.text, 'html.parser')
-            
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/126.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            }
+            html = None
+            last_err = None
+            for attempt in (1, 2):
+                if token != self._fetch_token:
+                    diag("FETCH ABORT: superseded by newer fetch")
+                    return
+                try:
+                    diag(f"FETCH attempt {attempt}...")
+                    t0 = time.monotonic()
+                    with requests.Session() as s:
+                        with s.get(url, headers=headers,
+                                   timeout=(10, 15), stream=True) as res:
+                            res.raise_for_status()
+                            chunks = []
+                            total = 0
+                            for chunk in res.iter_content(chunk_size=65536):
+                                if token != self._fetch_token:
+                                    diag("FETCH ABORT: superseded mid-download")
+                                    return
+                                if chunk:
+                                    chunks.append(chunk)
+                                    total += len(chunk)
+                                # Overall budget: 30s / 15MB max. This catches
+                                # stalled/trickling connections that per-read
+                                # timeouts alone cannot.
+                                if time.monotonic() - t0 > 30:
+                                    raise TimeoutError(
+                                        "download stalled (30s budget exceeded) - "
+                                        "connection is trickling or hanging")
+                                if total > 15_000_000:
+                                    break
+                            html = b"".join(chunks).decode(
+                                res.encoding or "utf-8", errors="replace")
+                    diag(f"FETCH attempt {attempt}: got {len(html)} chars "
+                         f"in {time.monotonic()-t0:.1f}s")
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    diag(f"FETCH attempt {attempt} failed: "
+                         f"{type(e).__name__}: {e}", exc=True)
+                    time.sleep(2)
+
+            if token != self._fetch_token:
+                return
+            if html is None:
+                if isinstance(last_err, requests.exceptions.ConnectionError):
+                    msg = ("Network Error: Cannot reach FitGirl. "
+                           "Is your ISP blocking it? Try a VPN/Custom DNS. "
+                           f"({last_err})")
+                elif isinstance(last_err, TimeoutError):
+                    msg = (f"Fetch stalled: {last_err} "
+                           "Try again or use a VPN/Custom DNS.")
+                else:
+                    msg = (f"Error fetching links: "
+                           f"{type(last_err).__name__}: {last_err}")
+                self._ui_put(self.update_ui, msg)
+                return
+
+            soup = BeautifulSoup(html, 'html.parser')
             ff_links = []
             for a in soup.find_all('a', href=True):
                 if 'fuckingfast.co' in a['href'] and a['href'] not in ff_links:
                     ff_links.append(a['href'])
-            
-            self.root.after(0, self.populate_checkboxes, ff_links)
-            
-        except requests.exceptions.ConnectionError:
-            # Restored Network Block warning!
-            self.root.after(0, self.update_ui, "Network Error: Cannot reach FitGirl. Is your ISP blocking it? Try a VPN/Custom DNS.")
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
+            diag(f"FETCH DONE: found {len(ff_links)} fuckingfast links")
+
+            if not ff_links:
+                low = html.lower()
+                if ('just a moment' in low or 'challenge-platform' in low
+                        or 'cf_chl' in low):
+                    self._ui_put(self.update_ui,
+                        "Page loaded but shows a bot-check (Cloudflare). "
+                        "requests can't pass it: try a VPN, or paste a "
+                        "different FitGirl mirror URL.")
+                else:
+                    self._ui_put(self.populate_checkboxes_token, token, [])
+                return
+            self._ui_put(self.populate_checkboxes_token, token, ff_links)
+
         except Exception as e:
             diag(f"FETCH ERROR: {e}", exc=True)
-            self.root.after(0, self.update_ui, f"Error fetching links: {str(e)}")
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
+            self._ui_put(self.update_ui, f"Error fetching links: {str(e)}")
+        finally:
+            self._ui_put(self._fetch_done, token)
 
     def populate_checkboxes(self, links):
         if not links:
@@ -287,6 +423,7 @@ class FitgirlExtractorApp:
     # --- Step 2: Extraction ---
     def get_browser_path(self, selected_browser="Auto-Detect Browser"):
         import sys
+        import shutil
         
         # Check if running on Linux / Steam Deck
         is_linux = sys.platform.startswith('linux')
@@ -313,6 +450,13 @@ class FitgirlExtractorApp:
                 r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe",
                 "/usr/bin/brave-browser",
                 "/usr/bin/brave",
+                "/usr/bin/brave-browser-stable",
+                # brave-origin naming (Fedora / custom installs)
+                "/usr/bin/brave-origin",
+                "/usr/bin/brave-origin-stable",
+                "/etc/alternatives/brave-origin",
+                "/opt/brave.com/brave-origin/brave-origin",
+                "/opt/brave.com/Brave-Origin/brave-origin",
                 "/var/lib/flatpak/exports/bin/com.brave.Browser" # Common Steam Deck Flatpak path
             ],
             "Mozilla Firefox": [
@@ -322,6 +466,13 @@ class FitgirlExtractorApp:
                 "/usr/bin/firefox",
                 "/var/lib/flatpak/exports/bin/org.mozilla.firefox"
             ]
+        }
+        # PATH-based binaries to check via shutil.which (handles brave-origin, etc.)
+        browser_which_names = {
+            "Google Chrome": ["google-chrome", "google-chrome-stable"],
+            "Microsoft Edge": ["microsoft-edge", "microsoft-edge-stable", "msedge"],
+            "Brave": ["brave-browser", "brave-browser-stable", "brave", "brave-origin", "brave-origin-stable"],
+            "Mozilla Firefox": ["firefox"],
         }
         
         if selected_browser != "Auto-Detect Browser":
@@ -336,6 +487,18 @@ class FitgirlExtractorApp:
             expanded_path = os.path.expandvars(path)
             if os.path.exists(expanded_path):
                 return expanded_path
+
+        # Fallback: search PATH (covers /usr/bin symlinks like brave-origin)
+        if selected_browser != "Auto-Detect Browser":
+            names_to_check = browser_which_names.get(selected_browser, [])
+        else:
+            names_to_check = []
+            for names in browser_which_names.values():
+                names_to_check.extend(names)
+        for name in names_to_check:
+            found = shutil.which(name)
+            if found and os.path.exists(found):
+                return found
         return None
     
 
@@ -361,14 +524,14 @@ class FitgirlExtractorApp:
         browser_executable = self.get_browser_path(selected_browser)
         
         if not browser_executable:
-            self.root.after(0, self.update_ui, f"Error: Could not find {selected_browser} on your system.")
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
-            self.root.after(0, lambda: self.extract_btn.config(state="normal"))
+            self._ui_put(self.update_ui, f"Error: Could not find {selected_browser} on your system.")
+            self._ui_put(lambda: self.fetch_btn.config(state="normal"))
+            self._ui_put(lambda: self.extract_btn.config(state="normal"))
             return
 
         browser_name = os.path.basename(browser_executable).replace('.exe', '')
         diag(f"EXTRACTION START: {total} links, browser={selected_browser} -> {browser_executable}")
-        self.root.after(0, self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
+        self._ui_put(self.update_ui, f"Initializing using {browser_name} to bypass Cloudflare...", 0, total)
         
         def create_driver(version=None):
             if browser_name.lower() == 'firefox':
@@ -441,7 +604,7 @@ class FitgirlExtractorApp:
                     if match:
                         correct_version = int(match.group(1))
                         working_version = correct_version
-                        self.root.after(0, self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
+                        self._ui_put(self.update_ui, f"Auto-fixing ChromeDriver version to v{correct_version}...")
                         driver = create_driver(version=correct_version)
                     else:
                         raise e
@@ -497,7 +660,7 @@ class FitgirlExtractorApp:
 
             for i, link in enumerate(links, 1):
                 filename = link.split('#')[-1] if '#' in link else link.split('/')[-1]
-                self.root.after(0, self.update_ui, f"Processing [{i}/{total}]: {filename}")
+                self._ui_put(self.update_ui, f"Processing [{i}/{total}]: {filename}")
                 
                 try:
                     driver.get(link)
@@ -525,23 +688,23 @@ class FitgirlExtractorApp:
                             break
                             
                     if direct_url:
-                        self.root.after(0, self.update_ui, None, i, None, direct_url)
+                        self._ui_put(self.update_ui, None, i, None, direct_url)
                     else:
-                        self.root.after(0, self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
+                        self._ui_put(self.update_ui, None, i, None, f"# FAILED: {filename} ({link})")
                         
                 except Exception as e:
-                    self.root.after(0, self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
+                    self._ui_put(self.update_ui, None, i, None, f"# ERROR: {str(e)} -> {filename}")
 
             else:
-                self.root.after(0, self.update_ui, f"Extraction complete! Processed {total} links.")
+                self._ui_put(self.update_ui, f"Extraction complete! Processed {total} links.")
             
         except Exception as e:
             diag(f"CRITICAL ERROR: {e}", exc=True)
-            self.root.after(0, self.update_ui, f"Critical Error: {str(e)}")
+            self._ui_put(self.update_ui, f"Critical Error: {str(e)}")
             
         finally:
-            self.root.after(0, lambda: self.fetch_btn.config(state="normal"))
-            self.root.after(0, lambda: self.extract_btn.config(state="normal"))
+            self._ui_put(lambda: self.fetch_btn.config(state="normal"))
+            self._ui_put(lambda: self.extract_btn.config(state="normal"))
             if driver:
                 try:
                     driver.quit()
